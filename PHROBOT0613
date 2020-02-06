@@ -1,0 +1,1282 @@
+/* -------------------------------------------------------
+/*      AT BEGINNING NOTICE
+/*  This code section is original source of Yong Wei
+/*  Later edit by Junzheng Li, Fangming Zhang
+/*  Here is the original code without edit.
+/*
+/*=======================================================*/
+/*Phenorobot control system code                         */
+/*This program is used to test the basic functions of Phe*/
+/*-robot, including manually controlling shade system ,  */
+/*lifter systems, steering system, and robot movement, au*/
+/*-tomatically control the robot movement by commands fro*/
+/*-m CON-BUS.                                            */
+/* Author: Yong Wei                                      */
+/* Date: 06-13-2016                                      */
+/*=======================================================*/
+#include <EEPROM.h>
+#include <Math.h>
+#include "mcp_can.h"
+#include <SPI.h>
+#include <stdio.h>
+#include <QTRSensors.h>
+#include <Wire.h>
+#include <Adafruit_MCP4725.h>
+
+Adafruit_MCP4725 dac;
+
+#define CAN_ID 0X00
+#define Minimum_pwm 2000
+
+
+#define INT8U unsigned char
+#define UINT unsigned int
+#define NUM_SENSORS   1     // number of sensors used
+#define TIMEOUT       3000  // waits for 2500 microseconds for sensor outputs to go low
+#define EMITTER_PIN   43     // emitter is controlled by digital pin 43
+#define kP 5
+#define kI 3
+#define kD 3
+/*QTR sensor is connected to digital pins 14*/
+QTRSensorsRC qtrrc((unsigned char[]) {14},
+  NUM_SENSORS, TIMEOUT, EMITTER_PIN); 
+unsigned int sensorValues[NUM_SENSORS];
+
+/* Dinfine interface of HUB-MOTOR */
+const int HM_CO_IN        = 17;   //OUTPUT PIN
+const int HM_EL           =16;    //OUTPUT PIN
+const int HM_SP           = 18;   //INPUT PIN
+const int HM_SP_CON       = 6;    //OUTPUT PIN
+
+
+/*Define interface of Steering Motor */
+const int SM_DIRA        =41;   //OUTPUT PIN
+const int SM_DIRB        =42;    //OUTPUT PIN
+const int SM_SP_CON      = 8;    //OUTPUT PIN
+
+/*Define interface of ENCODER */
+const int AXORB          =1;   // A^B
+const int ENCO_A         =3;   //OUTPUT PIN
+const int ENCO_B         =2;    //OUTPUT PIN
+const int ZERO_P        = 14;    //OUTPUT PIN 
+
+/*Define interface of Lifter Motor */
+const int LM_DIRA        =22;   //OUTPUT PIN
+const int LM_DIRB        =23;    //OUTPUT PIN
+const int LM_SP_CON      = 9;    //OUTPUT PIN
+
+/*Define interface of Curtain Motor */
+const int CM_DIRA        =28;   //OUTPUT PIN
+const int CM_DIRB        =29;    //OUTPUT PIN
+const int CM_SP_CON      =10;    //OUTPUT PIN
+
+/*Define interface of Brake Motor */
+const int BM_DIRA        =43;   //OUTPUT PIN
+const int BM_DIRB        =44;    //OUTPUT PIN
+const int BM_SP_CON      =7;    //OUTPUT PIN
+
+/*Define Address A0 about MCP4725 */
+const int MCP4725_A0=13;
+
+/*Array for motor control */
+const int MOTORS_PIN[5][3]={{HM_CO_IN,HM_EL,HM_SP_CON},
+                            {SM_DIRA,SM_DIRB,SM_SP_CON},
+                            {CM_DIRA,CM_DIRB,CM_SP_CON},
+                            {BM_DIRA,BM_DIRB,BM_SP_CON},
+                            {LM_DIRA,LM_DIRB,LM_SP_CON},
+                           };
+                           
+/*Define interface of KEYS */
+const int KEYI1          =30;   //INPUT PIN
+const int KEYI2          =31;   //INPUT PIN
+const int KEYI3          =32;   //INPUT PIN
+const int KEYI4          =33;   //INPUT PIN
+const int KEYI5          =38;   //INPUT PIN
+const int KEYI6          =39;   //INPUT PIN
+const int KEYI7          =24;   //INPUT PIN
+const int KEYI8          =25;   //INPUT PIN
+const int KEYI9          =26;   //INPUT PIN
+const int LED1           =34;   //OUTPUT PIN
+const int LED2           =35;   //OUTPUT PIN
+const int LED3           =36;   //OUTPUT PIN
+const int LED4           =37;   //OUTPUT PIN
+const int LED5           =45;   //OUTPUT PIN
+const int LED6           =46;   //OUTPUT PIN
+const int EMK1           =A6;
+const int EMK2           =A7;
+const int EMK3           =A8;
+const int EMK4           =A9;
+const int keys[8]={KEYI1,KEYI2,KEYI3,KEYI4,KEYI5,KEYI6,KEYI7,KEYI8};
+const int emks[4]={EMK1,EMK2,EMK3,EMK4};
+const int LEDS[6]={LED1,LED2,LED3,LED4,LED5,LED6};
+const int S_Threshold[4]={200,200,200,150}; 
+const int angle_co[4]={-1,1,-1,1};
+
+/*Global variables used in the program*/
+INT8U BAddress=0;
+INT8U command_t=0;
+UINT  HMPWM= 0;
+UINT  desired_sp=0;
+boolean desired_dir=0;
+INT8U report;
+INT8U Lifter_on_off;
+int  encoderPos=0;
+int  DencoderPos=0;
+int  encoderPosFlag=0;
+boolean Can_get_data = false;
+boolean ON_FLAG = false;
+boolean OFF_FLAG = false;
+boolean Test_run=false;
+INT8U Test_time=0;
+float speed_pi_p=0;
+float speed_pi_n=0;
+float Error=0;
+float Integral=0;
+float Derivative=0;
+float speed_present=0;
+float speed_preview=0;
+const INT8U BoardA[6][2]={{'F','R'},{'B','R'},{'F','L'},{'B','L'},{'A','L'},{'S','T'}};         // Board Addresses
+const INT8U Actuator_T[3]={'W','S','?'};                                                        // W----WHEELS; S----STEERING MOTOR
+const INT8U Direction[3][2]={{'F','B'},{'L','R'},{'S','W'}};                                    // F----Forward running; B----Backward running;   L---left turn;  R----right turn;
+
+
+/* Define arrays for saving the command parameters; After resetting the parameters, the action code is set zero.*/
+
+UINT   STATUS[2][3]={{0,0,0},{0,0,0}};                                                        // Action Code 0-waiting, 1-reset;Displacement direction: 0-Corotation,1-Inversion;  Speed;
+                                                                                               // 0-----wheel      1------steering motor
+
+/* Define arrays for saving the reported data */
+
+float Speed[2]={0,0};                                                                         //Displacement direction: 0-Corotation,1-Inversion;  Speed, num/min;
+int   angle=0;                                                                                //Turnning angle of steering motor; Positive angle-----right turn; Negative angle-----left turn;
+int d_time[4]={250,750,1250,1750};
+boolean reply=0;
+INT8U Flag_Recv = 0;
+INT8U len = 0;
+INT8U buf[8];
+INT8U Rbuf[8];
+INT8U j=0;
+
+/* Interrupt programs */
+void MCP2515_ISR()                                                                            //Can bus interrupt program,  Interrupt 4
+{
+     Flag_Recv = 1;
+     CAN.readMsgBuf(&len, Rbuf);
+}
+/* Encoder counting */
+void counting(void)                                                                           //Encoder interrupt program. Interrupt 1
+{
+      if (digitalRead(ENCO_B) == LOW) {
+       encoderPos--;
+           } 
+      else {
+       encoderPos++;
+          }
+       angle=3*pow(-1,BAddress)*encoderPos*angle_co[BAddress];
+     
+}
+
+/*=======================================================*/
+/*EEPROM INITIALIZATION                                  */
+/*Address 0 is used to store the address of control board*/
+/*Address Acronym            Description                 */
+/* 0       FR               Front Right Control Board    */
+/* 1       BR               Back  Right Control Board    */
+/* 2       FL               Front Left Control Board     */
+/* 3       BL               Back Left Control Board      */
+/*=======================================================*/
+void EEPROM_INI(void)
+{ 
+  int address;
+  BAddress=EEPROM.read(0);
+  if(BAddress>3)
+           BAddress=0;
+  report=EEPROM.read(1);
+  if(report==255)
+           report=1;
+  Serial.print("BOARD ADDRESS = "); Serial.write(BoardA[BAddress][0]);Serial.write(BoardA[BAddress][1]);  //Monitoring working state by USB COM
+  Serial.println();
+}
+
+/* Stop all motors*/
+void stop_all_motors()
+{
+ INT8U i;
+ for(i=0;i<5;i++)
+ {
+         motors_s(i);
+ }
+}
+
+/*Control system initialization*/
+void setup()
+{
+  CAN.begin(CAN_500KBPS);                   // init can bus : baudrate = 500k
+  attachInterrupt(4, MCP2515_ISR, FALLING); // start interrupt
+  Serial.begin(115200);
+  EEPROM_INI();
+  //ABOUT STEERING MOTOR PINS 
+  pinMode(SM_DIRA, OUTPUT); 
+  pinMode(SM_DIRB, OUTPUT); 
+  pinMode(SM_SP_CON, OUTPUT);
+  //ABOUT LIFTER MOTOR PINS 
+  pinMode(LM_DIRA, OUTPUT); 
+  pinMode(LM_DIRB, OUTPUT); 
+  pinMode(LM_SP_CON, OUTPUT);
+  //ABOUT CURTAIN MOTOR PINS 
+  pinMode(CM_DIRA, OUTPUT); 
+  pinMode(CM_DIRB, OUTPUT); 
+  pinMode(CM_SP_CON, OUTPUT);
+  //ABOUT BRAKE MOTOR PINS 
+  pinMode(BM_DIRA, OUTPUT); 
+  pinMode(BM_DIRB, OUTPUT); 
+  pinMode(BM_SP_CON, OUTPUT);
+  //ABOUT HUBMOTOR PINS 
+  pinMode(HM_CO_IN, OUTPUT); 
+  pinMode(HM_EL, OUTPUT); 
+  pinMode(HM_SP_CON, OUTPUT);
+  pinMode(HM_SP, INPUT);
+  //ABOUT LEDS PINS
+  pinMode(LED1, OUTPUT); 
+  pinMode(LED2, OUTPUT); 
+  pinMode(LED3, OUTPUT);
+  pinMode(LED4, OUTPUT);
+  pinMode(LED5, OUTPUT);
+  pinMode(LED6, OUTPUT);
+
+  //ABOUT KEYS PINS
+  pinMode(KEYI1, INPUT);
+  pinMode(KEYI2, INPUT);
+  pinMode(KEYI3, INPUT);
+  pinMode(KEYI4, INPUT);
+  pinMode(KEYI5, INPUT);
+  pinMode(KEYI6, INPUT); 
+  pinMode(KEYI7, INPUT);
+  pinMode(KEYI8, INPUT); 
+  pinMode(KEYI9, INPUT); 
+  //ABOUT ENCODER PINS
+  pinMode(AXORB,INPUT);
+  pinMode(ENCO_A, INPUT);
+  pinMode(ENCO_B, INPUT);
+  pinMode(ZERO_P, INPUT);
+  pinMode(EMK1, INPUT);
+  pinMode(EMK2, INPUT);
+  pinMode(EMK3, INPUT);
+  pinMode(EMK4, INPUT);
+  //About MCP4725
+  pinMode(MCP4725_A0, OUTPUT);
+  digitalWrite(MCP4725_A0, 0);
+  dac.begin(0x62);
+   
+  attachInterrupt(1, counting, RISING);
+  Lifter_on_off=0;
+  stop_all_motors(); 
+  dac.setVoltage(0, false);  
+  angle=0;
+  encoderPos=0;
+  desired_sp=0;
+}
+
+/*Starting motors*/
+void motors(int type,boolean Dir, int Duty)
+{
+  if(type==0&digitalRead(KEYI9)==0)          // For HUB Motor
+  {
+      digitalWrite(MOTORS_PIN[type][0], Dir);  
+      digitalWrite(MOTORS_PIN[type][1],1);
+      dac.setVoltage(Duty, false);
+  }
+  else
+  {
+      digitalWrite(MOTORS_PIN[type][0], Dir);    //For others, including steering motor, lifter motor, shade motor, and cooling fan
+      digitalWrite(MOTORS_PIN[type][1], !Dir);
+      analogWrite(MOTORS_PIN[type][2], Duty); 
+  }
+  
+  
+}
+
+/* Stop motors */
+void motors_s(int type)
+{
+  if(type==0)
+  {
+      digitalWrite(MOTORS_PIN[type][0], 1);
+      digitalWrite(MOTORS_PIN[type][1], 0);
+      dac.setVoltage(0, false);
+      desired_sp=0;
+  }
+  else
+  {
+      digitalWrite(MOTORS_PIN[type][0], 0);
+      digitalWrite(MOTORS_PIN[type][1], 0);
+      analogWrite(MOTORS_PIN[type][2], 0); 
+  } 
+
+}
+
+// Detecting speed
+float V_num(void)
+{
+  unsigned long  duration;
+  float speed_min;
+  
+    duration = pulseIn(HM_SP, HIGH);
+   // Serial.print("duration= ");Serial.println(duration);
+    if(duration!=0)speed_min=60000000/(72*duration); //72?
+    else speed_min=0;
+    return speed_min;
+}
+
+/*Average of Five speed values*/
+float average_s()
+{
+  float sp[5],t_sp=0;
+  for(char i=0;i<5;i++)
+  {
+     sp[i]=V_num();
+     delay(100);
+  }
+  for(char i=0;i<5;i++)
+  {
+     for(char j=i;j<5;j++)
+     {
+        if (sp[i]<sp[j])  
+        {
+           t_sp=sp[i];
+           sp[i]=sp[j];
+           sp[j]=t_sp;
+        }
+     }
+  }
+  t_sp=(sp[1]+sp[2]+sp[3])/3;
+  Speed[1]=t_sp;
+  Speed[0]=STATUS[0][1];
+   // Serial.print("SPEED= ");Serial.println(t_sp,1);
+  return(t_sp);
+}
+
+/*Commands to stop all motors for emergency */
+void mistake()
+{
+  INT8U STOP_B[8]={'S','T','O','P','-','r','o','E'};
+  STOP_B[5]=BoardA[BAddress][0];
+  STOP_B[6]=BoardA[BAddress][1];  
+  
+  Serial.print("STOP_B = ");
+  for(int j = 0; j<8; j++)    
+      {
+          Serial.write(STOP_B[j]);
+      }
+  CAN.sendMsgBuf(CAN_ID, 0, 8, STOP_B);
+}
+
+/*==============================================*/
+/*PID controls running speed. Didn't complete.*/
+/*Just finished the basic starting performance  */
+/*detection under non-load condition            */
+/*==============================================*/
+void myPID(INT8U dir)
+{ 
+  INT8U i=0;
+  speed_present=average_s();
+  if(speed_present==0)speed_preview=0;
+  Error=(desired_sp-speed_present)/60;
+  Integral=Error;
+  Derivative=(speed_preview-speed_present)/180;
+  float drive_num=90*(kP*Error+kI*Integral+kD*Derivative);  //Calculating the values of starting the HUB Motor based on desired speed
+  HMPWM=int(drive_num);
+  i=0;
+  while(speed_present<5)
+  {
+           if(HMPWM>Minimum_pwm)
+               {
+                    mistake();
+                    desired_sp=0;
+                    motors_s(0);
+                    break;
+               }
+          if(i!=0)
+              {
+                   delay(3000);
+              }
+          i++;
+          motors(0,dir,HMPWM);  
+          HMPWM= HMPWM+100;   
+          speed_present=V_num();
+  }
+         Serial.print("HMPWM= ");
+         Serial.println(HMPWM);
+}
+
+/*==============================================*/
+/*For keeping constant speed                    */
+/*==============================================*/
+void const_speed(INT8U dir)
+{
+    float speed_min;
+    float Delt_speed,RATE; 
+    speed_min=average_s();
+    speed_preview= speed_min;
+    if(desired_sp!=0)
+         {
+             Delt_speed=desired_sp-speed_min;
+             RATE=abs(Delt_speed)/1.5;
+             if(RATE>1&RATE<10)
+                       {
+                          if(Delt_speed>0) 
+                                    HMPWM=HMPWM+8;
+                          else HMPWM=HMPWM-8;
+                          HMPWM=constrain(HMPWM,0,4095);
+                          motors(0,dir,HMPWM);
+                       }
+             else
+                      {
+                            if(RATE>10)
+                            {
+                                 if(Delt_speed>0) 
+                                           HMPWM=HMPWM+100;
+                                 else HMPWM=HMPWM-100;
+                                 HMPWM=constrain(HMPWM,0,4095);
+                                 motors(0,dir,HMPWM);
+                            }
+                     }
+        }       
+  
+    delay(100);
+    Serial.print("HMPWM= ");Serial.println(HMPWM);
+    delay(100);
+    Serial.print("SPEED= ");Serial.println(speed_min,1);
+        
+}
+
+/*==============================================*/
+/*Printing parameters through COM port, which is*/
+/*used during testing encoder                   */
+/*==============================================*/
+void print_parameter()
+{
+      Serial.print("encoderPos= ");
+      Serial.println(encoderPos);
+      delay(10);
+      Serial.print("Angle= ");
+      Serial.println( angle);
+      delay(10);
+      qtrrc.read(sensorValues);
+      Serial.print("sensorValues[0] = "); 
+      Serial.println(sensorValues[0]);
+}
+
+/*==============================================*/
+/*Steering system turn back to Zero position    */
+/*==============================================*/
+void Turn_to_Zero(boolean s_dir)
+{
+    qtrrc.read(sensorValues);
+    Serial.print("sensorValues[0] = "); 
+    Serial.println(sensorValues[0]);
+    motors(1,s_dir,120);
+    while(sensorValues[0]<S_Threshold[BAddress])
+       {
+                   delay(20);
+                   qtrrc.read(sensorValues);
+                   Serial.print("sensorValues[0] = "); Serial.println(sensorValues[0]);
+       }
+    motors_s(1);
+    encoderPos=0;
+    angle=0;
+   
+}
+
+/*==============================================*/
+/*Steering system turn back to Zero position    */
+/*==============================================*/
+void Step_Turn(boolean s_dir)
+{
+  int pre_encoderPos;
+  int delta_step;
+  pre_encoderPos=encoderPos;
+  delta_step=abs(abs(pre_encoderPos)-abs(encoderPos));
+  motors(1,s_dir,120);
+  while(delta_step<1)
+    {
+         delta_step=abs(abs(pre_encoderPos)-abs(encoderPos));
+         delay(10);
+    }
+  motors_s(1);
+}
+
+/*==============================================*/
+/*Steering system turns a specified angle       */
+/*==============================================*/
+void Turn_Angle(boolean s_dir,int s_angle)
+{
+  int pre_encoderPos;
+  int delta_step;
+  pre_encoderPos=encoderPos;
+  delta_step=abs(abs(pre_encoderPos)-abs(encoderPos)+1)*3;
+  motors(1,s_dir,120);
+  while(delta_step<s_angle)
+    {
+         delta_step=abs(abs(pre_encoderPos)-abs(encoderPos)+1)*3;
+         delay(10);
+     }
+  motors_s(1);
+}
+
+/*==============================================*/
+/*Debugging function                            */
+/*This function is used to set board address,   */
+/*close/open report function, test steering sys.*/
+/*==============================================*/
+void set_BAddress()
+{
+    if(Serial.available()>0)
+    {
+      Serial.readBytes(buf, 8);   
+      delay(100);    
+      Serial.write(buf,8);
+      delay(100);
+      Serial.println(':');
+      switch(buf[0])
+      {
+        case 'A':case 'a':
+              BAddress=buf[1]&0x0f;
+              EEPROM.write(0,BAddress);
+              delay(100);
+              BAddress=0;
+              EEPROM_INI();
+        break;
+        case '?':
+              delay(100);
+              BAddress=0;
+              EEPROM_INI();
+              Serial.print("Report ");
+              if(report==0)
+                {
+                      Serial.println("OFF !");
+                }
+             if(report==1)
+               {
+                     Serial.println("ON !");
+               }
+        break;
+        
+        case 'R':case 'r':
+             report=buf[1]&0x0f;
+             EEPROM.write(1,report);
+             delay(100);
+             report=0;
+             EEPROM_INI();
+             Serial.print("Report ");
+             if(report==0)
+                 {
+                      Serial.println("OFF !");
+                 }
+            if(report==1)
+                {
+                      Serial.println("ON !");
+                }
+         break;
+
+      // Following code is used to test the encoder;
+      
+         case 'B':case 'b':                           //Clear encoderPos and DencoderPos
+               encoderPos=0;
+               angle=0;
+               print_parameter();
+               delay(1000);
+               print_parameter();  
+         
+         break;
+
+         case 'L':case 'l':                          // trun left to the zero position, 1---left turn; 0----right turn
+              Turn_to_Zero(1);
+              print_parameter();
+         break;
+
+         case 'M':case 'm':                          // trun right to the zero position, 1---left turn; 0----right turn
+              Turn_to_Zero(0);
+              print_parameter();
+         break;
+
+         case 'C':case 'c':                         // Step left turn, 1---left turn; 0----right turn
+              Step_Turn(1);
+              print_parameter();
+         break;
+
+         case 'D':case 'd':                         // Step right turn, 1---left turn; 0----right turn
+             Step_Turn(0);
+             print_parameter();
+         break;
+
+
+         case 'E':case 'e':                         // Left turn 90 degree
+              Turn_Angle(1,90);
+              print_parameter();
+         break;
+
+         case 'F':case 'f':                        //Right turn 90 degree
+               Turn_Angle(0,90);
+               print_parameter();
+         break;
+     // End of testing encoder code
+      
+         default: break;      
+      }
+     
+  }
+}
+
+/*==============================================*/
+/*Clearing buffer                               */
+/*==============================================*/
+void clear_buf()
+{
+   INT8U i;
+   for(i=0;i<8;i++)
+     {
+             buf[i]=0;
+     }
+}
+
+/*==============================================*/
+/*Save data to buf for decoding                 */
+/*==============================================*/
+void save_data(INT8U j)
+{
+  INT8U i;
+  for(i=0;i<8;i++)
+     {
+         if(j==1) buf[i]=Rbuf[i];
+         Rbuf[i]=0;
+     }
+}
+
+/*==============================================*/
+/*Address verification                          */
+/*==============================================*/
+INT8U check_board()
+{
+  INT8U i,j;
+  for(i=0;i<6;i++)
+  {
+    if((Rbuf[0]==BoardA[i][0])&(Rbuf[1]==BoardA[i][1])) 
+    {
+         j=i+1;
+         break;
+    
+    }
+    else j=0;     
+  }
+
+  
+  delay(100);
+  Serial.write(BoardA[BAddress][0]);
+  Serial.write(BoardA[BAddress][1]);
+  Serial.println(" GETS DATA!");
+  Serial.print("data len = ");
+  Serial.println(len);
+  Serial.print("j = ");Serial.println(j);
+  Serial.print("Can Send Ok\r\n");
+  delay(100);
+        
+  return j;
+}
+
+/*==============================================*/
+/*Decoding function                             */
+/*The function is used to decode the commands   */
+/*from the CAN BUS                              */
+/*==============================================*/
+void set_parameter()
+{ 
+  INT8U i, j,k;
+  switch(buf[2])
+  {
+       case 'W':  case 'w': i=0; break;
+       case 'S':  case 's': i=1; break;
+       case '?': reply=1;goto loop4; break;
+       default: goto loop1; break;
+  }
+  switch(buf[3])
+  {
+       case 'R': STATUS[i][1]=0; break;                        // 1-----Forward running or right turn;
+       case 'L': STATUS[i][1]=1; break;                        // -1----Backward running or left turn;
+       case 'F': STATUS[i][1]=1; break;                        // 1-----Forward running or right turn;
+       case 'B': STATUS[i][1]=0; break;                        // -1----Backward running or left turn;
+       default: goto loop2; break;
+  }
+ switch(buf[4])
+  {
+      case 'S':  STATUS[i][0]=1; break;                                 // 1------Starting
+      case 'W':  STATUS[i][0]=0; break;                                 // 0-----Waiting
+      default: goto loop3; break;
+  } 
+  
+  STATUS[i][2]=get_s_v();
+  loop4:loop3:loop2:loop1: 
+  clear_buf();
+}
+
+/*==============================================*/
+/*Respopnsing function for emergency            */
+/*==============================================*/
+void answer()
+{
+  INT8U STOP_B[8]={'#','L','L','-','-','0','K','!'};
+ 
+  STOP_B[1]=BoardA[BAddress][0];
+  STOP_B[2]=BoardA[BAddress][1];  
+  
+  Serial.print("STOP_B = ");
+  for( j = 0; j<8; j++)    
+      {
+        Serial.write(STOP_B[j]);
+      }
+ CAN.sendMsgBuf(CAN_ID, 0, 8, STOP_B);
+}
+
+/*==============================================*/
+/*Respopnsing function for emergency            */
+/*==============================================*/
+void take_parameter()
+{ INT8U i,j,k;
+  i=check_board();
+  switch(i)
+  {
+    case 0:
+    save_data(0);
+    break;
+    case 1:case 2:case 3:case 4:
+    if(i==(BAddress+1))
+    {
+      save_data(1);      
+      set_parameter();
+      //answer();
+    }
+    break;
+    case 5:
+    save_data(1);
+    set_parameter();
+    break;
+    case 6:
+    stop_all_actuators();
+    save_data(0);
+     break;
+    default: 
+    save_data(0);
+    break;    
+  }
+  
+}
+
+/*==============================================*/
+/*Stop all motors for emergency                 */
+/*==============================================*/
+void stop_all_actuators()
+{
+INT8U STOP_B[8]={'#','L','L','S','T','O','P','!'};
+STOP_B[1]=BoardA[BAddress][0];
+STOP_B[2]=BoardA[BAddress][1];
+stop_all_motors();
+delay(d_time[BAddress]);
+CAN.sendMsgBuf(CAN_ID, 0, 8, STOP_B);    
+
+}
+
+/*==============================================*/
+/*Stop all motors for emergency                 */
+/*==============================================*/
+void check_address()
+{ 
+  if(Flag_Recv)                   // check if get data
+    {
+      Flag_Recv = 0;   // clear flag
+      
+      Serial.println("CAN_BUS GET DATA!");
+      Serial.print("data len = ");Serial.println(len);
+      for(int i = 0; i<len; i++)    // print the data
+      {
+        Serial.write(Rbuf[i]);
+      }
+      Serial.println();      
+      take_parameter();
+    }
+     
+}
+
+/*==============================================*/
+/*Get speed data or angle data from comments    */
+/*==============================================*/
+int get_s_v()
+{
+  int SPEED_V=0;
+  if((buf[5]&0x0f==0)&(buf[6]&0x0f==0)&(buf[7]&0x0f==0))
+   {
+          SPEED_V=0;
+   }
+  else
+  {
+         SPEED_V=int(buf[5]&0x0f)*100+int(buf[6]&0x0f)*10+int(buf[7]&0x0f);
+  }
+ 
+  Serial.print("SPEED_V = ");
+  Serial.println(SPEED_V);
+  return(SPEED_V);
+}
+
+/*==============================================*/
+/*Execution instruction                         */
+/*==============================================*/
+void RUNNING()
+{
+  INT8U i;
+  for(i=0;i<2;i++)
+  { 
+    if(STATUS[i][0]==1)
+        {
+           if(i==0) 
+            {desired_sp=STATUS[i][2]%100;
+            if(BAddress<2) desired_dir=!boolean(STATUS[i][1]);
+            else  desired_dir=boolean(STATUS[i][1]);
+             if(desired_sp==0)
+             {
+                 motors_s(0);  
+                 motors_s(3); 
+             }
+             else
+             { Test_time=STATUS[i][2]/100;
+               motors(3,1,255);
+               //motors(0,desired_dir,Minimum_pwm);
+               delay(1000);
+               myPID(desired_dir);  
+               //delay(3000);
+             }
+            }
+           else
+           {
+              if(STATUS[i][2]!=0) Turn_Angle(STATUS[i][1],STATUS[i][2]);
+              else Turn_to_Zero(STATUS[i][1]);
+           }
+          STATUS[i][0]=0;
+          STATUS[i][2]=0;
+       }
+      
+ }  
+ 
+}
+
+/*==============================================*/
+/*Execution instruction                         */
+/*==============================================*/
+void sent_info(INT8U i,INT8U j)
+{
+  INT8U STOP_B[8]={'#','T','L','E','T','O','P','!'};
+  INT8U STOP_B1[8]={'S','T','O','P','A','L','L','!'};
+  if(ON_FLAG&OFF_FLAG)
+  {
+   ON_FLAG=0;
+   OFF_FLAG=0;
+   STOP_B[1]=BoardA[BAddress][0];
+   STOP_B[2]=BoardA[BAddress][1];
+   switch(j)
+   {
+         case 'O': 
+               STOP_B[4]='P'; STOP_B[5]='O'; STOP_B[6]='n';
+               CAN.sendMsgBuf(CAN_ID, 0, 8, STOP_B); 
+         break;
+         case 'C': case 'c':
+               STOP_B1[4]='P'; STOP_B1[5]='O'; STOP_B1[6]='f';STOP_B1[7]='f';
+               CAN.sendMsgBuf(CAN_ID, 0, 8, STOP_B1); 
+         break;
+         case 'B':
+               STOP_B1[4]='B'; STOP_B1[5]='J'; STOP_B1[6]='a';STOP_B1[7]='m';
+               CAN.sendMsgBuf(CAN_ID, 0, 8, STOP_B1); 
+          break;
+          case 'F': 
+               STOP_B1[4]='F'; STOP_B1[5]='J'; STOP_B1[6]='a';STOP_B1[7]='m';
+               CAN.sendMsgBuf(CAN_ID, 0, 8, STOP_B1); 
+          break;  
+          default:break;
+   }
+  }
+}
+
+/*==============================================*/
+/*Manually control shade system                 */
+/*==============================================*/
+void manul_curtain(INT8U n, INT8U dir,INT8U ACT,INT8U duty)
+{ float sp;
+  digitalWrite(LEDS[n],1);motors(ACT,dir,duty);
+  while(digitalRead(keys[n]));
+  digitalWrite(LEDS[n],0);
+  motors_s(ACT);  
+}
+
+/*==============================================*/
+/*Manually control steering system              */
+/*==============================================*/
+void manul_steering(INT8U n, INT8U dir,INT8U ACT,INT8U duty)
+{ float sp;
+  digitalWrite(LEDS[n],1);motors(ACT,dir,duty);
+  while(digitalRead(keys[n]))
+  {
+    qtrrc.read(sensorValues);
+    Serial.print("sensorValues[0] = "); Serial.println(sensorValues[0]);
+    delay(10);
+    Serial.print("encoderPos = "); Serial.println(encoderPos);
+    delay(10);     
+    Serial.print("Angle = ");Serial.println(angle);
+    delay(10);
+    //Serial.print("DencoderPos = "); Serial.println(DencoderPos);
+    //delay(10);
+  }
+  digitalWrite(LEDS[n],0);
+  motors_s(ACT);  
+}
+
+/*==============================================*/
+/*Manually control robot to run                 */
+/*==============================================*/
+void manul_movement(INT8U n, INT8U dir,INT8U ACT,int duty)
+{ 
+  float sp;
+  INT8U N0=0;
+  speed_present=0;
+  speed_preview=0;
+  Integral=0;
+  if(BAddress==1|BAddress==3){N0=4;}
+  digitalWrite(LEDS[n],1);
+  desired_sp=60;
+  motors(3,1,255);
+ //motors(0,dir,duty);
+ //delay(5000);
+ // while(digitalRead(keys[n+N0])){speed_present=V_num();delay(1000);}
+  myPID(dir);  
+  delay(2000); 
+  while(digitalRead(keys[n+N0])){const_speed(dir);delay(3000);}
+  digitalWrite(LEDS[n],0);
+  motors_s(ACT);  
+  motors_s(3); 
+  delay(3000);
+}
+
+/*==============================================*/
+/*Key scan                                      */
+/*==============================================*/
+INT8U keyscan()
+{
+  INT8U key_value=0;
+  for(INT8U i=0;i<6;i++)
+  {
+      key_value=(key_value<<1)+digitalRead(keys[i]);; 
+  }
+ return key_value;
+}
+
+/*==============================================*/
+/*Manually control main function  A             */
+/*==============================================*/
+void manually_runA(INT8U key_value)
+{
+  boolean dir=1;
+  if(BAddress==2) dir=!dir;
+  if(digitalRead(KEYI9)==1)
+  {
+    switch(key_value)
+    {
+        case 0x20:manul_steering(0, 1,1,150);break;
+        case 0x10:manul_steering(1, 0,1,150);break;
+        case 0x02:manul_curtain(4, 1,4,255);break;
+        case 0x01:manul_curtain(5, 0,4,255);break;
+        default: break;
+    }
+  }
+  else
+  {
+    switch(key_value)
+    {
+      case 0x20:manul_curtain(0, 1,2,255);break;
+      case 0x10:manul_curtain(1, 0,2,255);break;
+  // case 0x20:manul_movement(0, dir,0,Minimum_pwm);break;//manul_curtain(0, 1,2,255);break;
+  // case 0x10:manul_movement(1, !dir,0,Minimum_pwm);break;//manul_curtain(1, 0,2,255);break;
+      case 0x02:    manul_movement(4, dir,0,Minimum_pwm);break;
+      case 0x01:    manul_movement(5, !dir,0,Minimum_pwm);break;
+    
+     default: break;
+    }
+  }
+  desired_sp=0;
+}
+
+/*==============================================*/
+/*Manually control main function  B             */
+/*==============================================*/
+void manually_runB(INT8U key_value)
+{
+  boolean dir=1;
+  if(BAddress==3) dir=!dir;
+  if(digitalRead(KEYI9)==1)
+  {
+    switch(key_value)
+    { //case 0x80:digitalWrite(LEDS[1],0);digitalWrite(LEDS[0],1);sent_info(0,'C');OFF_FLAG=1;break;
+    //case 0x40:digitalWrite(LEDS[1],1);digitalWrite(LEDS[0],0);digitalWrite(LEDS[2],0);digitalWrite(LEDS[3],0);sent_info(0,'O');ON_FLAG=1;break;
+    //case 0x20:digitalWrite(LEDS[1],0);digitalWrite(LEDS[2],1);sent_info(0,'B');OFF_FLAG=1;break;
+    //case 0x10:digitalWrite(LEDS[1],0);digitalWrite(LEDS[3],1);sent_info(0,'F');OFF_FLAG=1;break;
+       case 0x80:
+                 if(BAddress==3){digitalWrite(LEDS[1],0);digitalWrite(LEDS[0],1);stop_all_motors();sent_info(0,'C');}
+                 else {digitalWrite(LEDS[1],0);digitalWrite(LEDS[2],1);stop_all_motors();sent_info(0,'B');}
+                 OFF_FLAG=1;
+       break;
+       case 0x40:
+                 digitalWrite(LEDS[1],1);digitalWrite(LEDS[0],0);digitalWrite(LEDS[2],0);digitalWrite(LEDS[3],0);sent_info(0,'O');ON_FLAG=1;
+       break;
+       case 0x20:
+              if(BAddress==3){digitalWrite(LEDS[1],0);digitalWrite(LEDS[2],1);stop_all_motors();sent_info(0,'B');}
+              else{digitalWrite(LEDS[1],0);digitalWrite(LEDS[0],1);stop_all_motors();sent_info(0,'C');}
+              OFF_FLAG=1;
+       break;
+       case 0x10:
+              digitalWrite(LEDS[1],0);digitalWrite(LEDS[3],1);stop_all_motors();sent_info(0,'F');OFF_FLAG=1;
+       break;
+       case 0x48:
+            manul_steering(4, 1,1,150);
+       break;
+       case 0x44:
+            manul_steering(5, 0,1,150);
+       break;
+       case 0x42:
+           manul_curtain(2, 1,4,255);
+       break;
+       case 0x41:
+           manul_curtain(3, 0,4,255);
+       break;
+       default: break;
+    }
+  }
+  else
+  {
+     switch(key_value)
+     { 
+        case 0x80:
+              if(BAddress==3){digitalWrite(LEDS[1],0);digitalWrite(LEDS[0],1);stop_all_motors();sent_info(0,'C');}
+              else {digitalWrite(LEDS[1],0);digitalWrite(LEDS[2],1);stop_all_motors();sent_info(0,'B');}
+              OFF_FLAG=1;
+        break;
+        case 0x40:
+              digitalWrite(LEDS[1],1);digitalWrite(LEDS[0],0);digitalWrite(LEDS[2],0);digitalWrite(LEDS[3],0);sent_info(0,'O');ON_FLAG=1;
+        break;
+        case 0x20:
+              if(BAddress==3){digitalWrite(LEDS[1],0);digitalWrite(LEDS[2],1);stop_all_motors();sent_info(0,'B');}
+              else{digitalWrite(LEDS[1],0);digitalWrite(LEDS[0],1);stop_all_motors();sent_info(0,'C');}
+              OFF_FLAG=1;
+        break;
+        case 0x10:
+              digitalWrite(LEDS[1],0);digitalWrite(LEDS[3],1);stop_all_motors();sent_info(0,'F');OFF_FLAG=1;
+        break;
+        case 0x48: 
+              manul_curtain(4, 0,2,255);
+        break;
+        case 0x44: 
+             manul_curtain(5, 1,2,255);
+        break;
+    //case 0x48:manul_movement(4, dir,0,Minimum_pwm);break;//manul_curtain(4, 0,2,255);break;
+    //case 0x44:manul_movement(5, !dir,0,Minimum_pwm);break;//manul_curtain(5, 1,2,255);break;
+        case 0x42:
+              manul_movement(2, dir, 0,Minimum_pwm);desired_sp=0;        
+        break;
+        case 0x41:
+              manul_movement(3, !dir,0,Minimum_pwm);desired_sp=0;
+        break;
+        default: break;
+     }
+  }
+
+}
+
+/*================================================*/
+/*Get excutive code and call the related function */
+/*================================================*/
+void keys_detect()
+{
+  INT8U i,j;
+  INT8U key_value=0;
+  if(BAddress==0|BAddress==2)
+   {
+       key_value=keyscan()&0x33;
+       delay(200);
+       key_value=keyscan()&0x33;
+
+       if(key_value!=0)
+       { //Serial.print("key_value = ");Serial.println(key_value,HEX); 
+             manually_runA(key_value);
+  
+       }
+  }
+else
+ {
+      for(i=0;i<8;i++)
+      {
+         if(i<4)
+          {
+               boolean BSL;
+               if(analogRead(emks[i])<850) BSL=0;
+               else BSL=1;
+               key_value=(key_value<<1)+BSL;
+          }
+         else
+          {
+               key_value=(key_value<<1)+digitalRead(keys[i]);
+          }
+ 
+      }
+
+  if(key_value!=0)
+    {//Serial.print("key_value = ");Serial.println(key_value,HEX);
+           manually_runB(key_value);  
+    }
+
+ }
+}
+
+/*================================================*/
+/*Get excutive code and call the related function */
+/*================================================*/
+void can_send_data()
+{
+  INT8U DATA_B[8];
+  int speed_v; 
+  if(reply==1)
+  { 
+        DATA_B[0]='#';
+        DATA_B[1]=BoardA[BAddress][0];
+        DATA_B[2]=BoardA[BAddress][1];
+        DATA_B[3]='S';
+   if(STATUS[0][1]==1) DATA_B[4]='F';
+   else DATA_B[4]='B';
+   speed_v=int((Speed[1]+0.5));
+   DATA_B[5]=speed_v/100+0x30;
+   DATA_B[6]=(speed_v%100)/10+0x30;
+   DATA_B[7]=speed_v%10+0x30;
+   CAN.sendMsgBuf(CAN_ID, 0, 8, DATA_B);  
+   delay(100);
+   DATA_B[3]='A';
+   if(angle==0)
+   {
+      DATA_B[4]=0x30;DATA_B[5]=0x30;DATA_B[6]=0x30;DATA_B[7]=0x30;
+   }
+   else
+  {
+     speed_v=abs(angle);
+     if(angle<0)  DATA_B[4]='-';
+     else         DATA_B[4]='+';
+     DATA_B[5]=speed_v/100+0x30;
+     DATA_B[6]=(speed_v%100)/10+0x30;
+     DATA_B[7]=speed_v%10+0x30;
+  }
+  CAN.sendMsgBuf(CAN_ID, 0, 8, DATA_B);
+  reply=0;
+}
+}
+
+/*================================================*/
+/*Check data function used during debugging       */
+/*================================================*/
+void check_data()
+{ 
+  INT8U i,k,j;
+  INT8U NUM=0;
+  int speed_v;
+  if(report)
+  {
+
+    for(i=0;i<2;i++)
+    {
+      Serial.print("Actuator type = ");
+      switch(i)
+      { case 0:
+             Serial.println("Wheel");
+        break;
+        case 1:
+             Serial.println("Steering system");
+        break;
+        }
+     
+       for(k=0;k<3;k++)
+        {  
+          NUM=STATUS[i][k]/100;
+          Serial.print(NUM);
+          NUM=(STATUS[i][k]%100)/10;
+          Serial.print(NUM);;
+          NUM=STATUS[i][k]%10;
+          Serial.print(NUM);
+          delay(100);Serial.print('\t');
+        }
+      delay(100);Serial.println();
+    
+    }  
+ 
+ }
+report=0;
+}
+
+/*======================================================*/
+/*Delay time function used in the speed control process */
+/*======================================================*/
+void delay_t(INT8U j)
+{
+  INT8U i;
+  float s;
+  for(i=0;i<j;i++)
+  {
+     delay(100);
+     if(i%10==0){s=average_s();}
+     if(Flag_Recv)
+     {
+        check_address();
+        RUNNING();
+     }
+    keys_detect();
+  }
+}
+
+
+void loop()
+{ char serial_flag=0;
+  char i,k;
+    if(Flag_Recv)       // Recieve the comments from CAN BUS
+    {
+        check_address();
+        RUNNING();
+    }
+    set_BAddress();    
+    check_data();
+    if(desired_sp!=0)
+    {
+      
+      if(Test_time==0)
+      { 
+           const_speed(desired_dir);       
+           delay_t(10);
+      }
+      else
+      {
+        for(i=0;i<Test_time;i++)
+        {
+            const_speed(desired_dir);
+            delay_t(10);
+        }
+        desired_sp=0;
+        motors_s(0);
+        motors_s(3);
+      }
+    
+    }
+    keys_detect();
+    can_send_data();
+    for(j=0;j<8;j++)
+    {
+      buf[j]=0;
+    }
+   }
